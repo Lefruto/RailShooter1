@@ -1,276 +1,152 @@
-using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.InputSystem;
 
+/// <summary>
+/// Controls ship weapon firing with fire rate / cooldown control,
+/// particle laser emission, laser targeting, and audio feedback.
+/// </summary>
 public class PlayerWeapons : MonoBehaviour
 {
-    [Header("Weapon Particle Systems")]
-    [Tooltip("Ateş eden lazer sistemleri (Laser_L ve Laser_R)")]
-    [SerializeField] private ParticleSystem[] lasers;
+    [Header("Lasers & Targeting")]
+    [SerializeField] ParticleSystem[] lasers;
+    [SerializeField] Transform targetPoint;
+    [SerializeField] float targetDistance = 50f;
 
-    [Header("Aim & Target Cubes")]
-    [Tooltip("Lazerlerin takip edeceği Cube objeleri. Boş bırakılırsa lazerlerin içindeki Cube objeleri otomatik bulunur.")]
-    [SerializeField] private Transform[] targetCubes;
-
-    [Tooltip("Kamera referansı (Boş bırakılırsa otomatik bulunur)")]
-    [SerializeField] private Camera mainCamera;
-
-    [Tooltip("Hedef küplerin geminin önündeki sabit mesafesi (Z ekseni sabit kalır)")]
-    [SerializeField] private float aimDistance = 25f;
-
-    [Tooltip("Fareyi takip etme yumuşaklığı (0 verilirse anında takip eder)")]
-    [SerializeField] private float aimSmoothSpeed = 25f;
-
-    [Tooltip("True ise iki lazer farenin hedeflediği tek noktada birleşir (Crosshair). False ise paralel kalırlar.")]
-    [SerializeField] private bool convergeAtCrosshair = true;
-
-    [Tooltip("Oyun esnasında hedef küplerin görünmesini istemiyorsanız işaretleyin.")]
-    [SerializeField] private bool hideCubesInGame = false;
+    [Header("Fire Rate & Cooldown")]
+    [SerializeField] float fireRate = 0.15f; // Cooldown between shots/bursts
+    [SerializeField] bool rapidFireActive = false;
 
     private bool isFiring = false;
+    private float nextFireTime = 0f;
+
+    void Awake()
+    {
+        // Fail-safe: locate lasers in children if not assigned in inspector
+        if (lasers == null || lasers.Length == 0)
+        {
+            lasers = GetComponentsInChildren<ParticleSystem>();
+        }
+
+        // Fail-safe: find or create TargetPoint if missing
+        if (targetPoint == null)
+        {
+            GameObject tp = GameObject.Find("TargetPoint");
+            if (tp != null)
+            {
+                targetPoint = tp.transform;
+            }
+            else
+            {
+                targetPoint = new GameObject("TargetPoint").transform;
+            }
+        }
+    }
 
     void Start()
     {
-        InitializeCamera();
-        InitializeTargetCubes();
+        foreach (ParticleSystem laser in lasers)
+        {
+            if (laser == null) continue;
+            var collisionModule = laser.collision;
+            collisionModule.enabled = true;
+            collisionModule.type = ParticleSystemCollisionType.World;
+            collisionModule.sendCollisionMessages = true;
+            collisionModule.lifetimeLoss = 1f;
+
+            var emission = laser.emission;
+            emission.enabled = false;
+
+            laser.Play();
+        }
     }
 
     void Update()
     {
-        UpdateCubePositionsAndLaserAim();
-        HandleInput();
+        MoveTargetPoint();
+        AimLasers();
+        ProcessFiring();
     }
 
-    private void InitializeCamera()
+    public void OnAttack(InputValue value)
     {
-        if (mainCamera == null)
-        {
-            mainCamera = Camera.main;
-            if (mainCamera == null)
-            {
-                mainCamera = FindFirstObjectByType<Camera>();
-            }
-        }
+        isFiring = value.isPressed;
     }
 
-    private void InitializeTargetCubes()
+    public void OnFire(InputValue value)
     {
-        // Eğer targetCubes Inspector'dan atanmamışsa, lasers dizisindeki objelerin içinde Cube ara
-        if ((targetCubes == null || targetCubes.Length == 0) && lasers != null)
-        {
-            List<Transform> foundCubes = new List<Transform>();
+        isFiring = value.isPressed;
+    }
 
-            foreach (var laser in lasers)
+    private void ProcessFiring()
+    {
+        float currentRate = rapidFireActive ? (fireRate * 0.5f) : fireRate;
+
+        if (isFiring && Time.time >= nextFireTime)
+        {
+            nextFireTime = Time.time + currentRate;
+
+            // Trigger burst on all lasers
+            foreach (ParticleSystem laser in lasers)
             {
                 if (laser == null) continue;
-
-                Transform cube = laser.transform.Find("Cube");
-                if (cube == null)
-                {
-                    // İsmi küçük/büyük harf veya "Cube" içeren alt objeyi ara
-                    foreach (Transform child in laser.transform)
-                    {
-                        if (child.name.IndexOf("cube", System.StringComparison.OrdinalIgnoreCase) >= 0)
-                        {
-                            cube = child;
-                            break;
-                        }
-                    }
-                }
-
-                // Eğer isimle bulunamadıysa ilk alt objeyi al
-                if (cube == null && laser.transform.childCount > 0)
-                {
-                    cube = laser.transform.GetChild(0);
-                }
-
-                if (cube != null)
-                {
-                    foundCubes.Add(cube);
-                }
+                laser.Emit(1);
             }
 
-            targetCubes = foundCubes.ToArray();
+            // Audio feedback
+            if (AudioManager.Instance != null)
+            {
+                AudioManager.Instance.PlayLaser(0.35f);
+            }
         }
 
-        // Küpleri hazırla
-        if (targetCubes != null)
+        // Keep continuous emission module enabled only if continuous fire is desired
+        foreach (ParticleSystem laser in lasers)
         {
-            foreach (var cube in targetCubes)
-            {
-                if (cube == null) continue;
-
-                // 1. Collider'ı kapat: Mermilerin/lazerlerin veya geminin hedef küpe çarpmasını engelle
-                Collider col = cube.GetComponent<Collider>();
-                if (col != null)
-                {
-                    col.enabled = false;
-                }
-
-                // 2. İsteğe bağlı olarak görseli gizle
-                if (hideCubesInGame)
-                {
-                    Renderer rend = cube.GetComponent<Renderer>();
-                    if (rend != null)
-                    {
-                        rend.enabled = false;
-                    }
-                }
-
-                // 3. Küpü lazerin içinden çıkarıp doğrudan gemiye (bu objeye) bağla
-                // Bu sayede lazer küpe doğru dönerken küp de onunla birlikte dönüp titreşme (jitter) yapmaz
-                cube.SetParent(this.transform, true);
-            }
+            if (laser == null) continue;
+            var emissionModule = laser.emission;
+            // Laser emission is paced by fireRate
+            emissionModule.enabled = isFiring;
         }
     }
 
-    private void UpdateCubePositionsAndLaserAim()
+    private void MoveTargetPoint()
     {
-        if (mainCamera == null || lasers == null || lasers.Length == 0) return;
+        if (targetPoint == null) return;
+        Camera mainCam = Camera.main;
+        if (mainCam == null) return;
 
-        // 1. Farenin ekran konumunu al
-        Vector2 mouseScreenPos;
+        Vector2 mousePos = Vector2.zero;
         if (Mouse.current != null)
         {
-            mouseScreenPos = Mouse.current.position.ReadValue();
+            mousePos = Mouse.current.position.ReadValue();
         }
         else
         {
-            mouseScreenPos = Input.mousePosition;
+            mousePos = Input.mousePosition;
         }
 
-        // 2. Kameradan fareye doğru bir Ray oluştur
-        Ray ray = mainCamera.ScreenPointToRay(mouseScreenPos);
-
-        // Farenin baktığı dünya konumunu al
-        Vector3 worldAimPoint = ray.GetPoint(aimDistance);
-
-        // Bu noktayı geminin (Model) yerel koordinat sistemine çevir
-        Vector3 localAimPoint = transform.InverseTransformPoint(worldAimPoint);
-
-        // 3. Küpleri sadece X ve Y eksenlerinde hareket ettir & Lazerleri küplere çevir
-        for (int i = 0; i < lasers.Length; i++)
-        {
-            var laser = lasers[i];
-            if (laser == null) continue;
-
-            Transform cube = null;
-            if (targetCubes != null && targetCubes.Length > 0)
-            {
-                if (i < targetCubes.Length && targetCubes[i] != null)
-                {
-                    cube = targetCubes[i];
-                }
-                else
-                {
-                    cube = targetCubes[0]; // Tek bir küp varsa her iki lazer de onu kullanır
-                }
-            }
-            //Test
-
-            if (cube == null) continue;
-
-            // X ve Y değerlerini hesapla
-            float targetLocalX = localAimPoint.x;
-            float targetLocalY = localAimPoint.y;
-
-            // Eğer lazerler paralel kalsın isteniyorsa, lazerin kendi X ofsetini koru
-            if (!convergeAtCrosshair)
-            {
-                Vector3 laserLocalPos = transform.InverseTransformPoint(laser.transform.position);
-                targetLocalX += laserLocalPos.x;
-            }
-
-            // Z ekseni KESİNLİKLE SABİT kalır!
-            float targetLocalZ = aimDistance;
-
-            Vector3 targetLocalPos = new Vector3(targetLocalX, targetLocalY, targetLocalZ);
-
-            // Yumuşak geçişle (Smooth) veya anında konumu uygula
-            if (aimSmoothSpeed > 0f)
-            {
-                cube.localPosition = Vector3.Lerp(cube.localPosition, targetLocalPos, Time.deltaTime * aimSmoothSpeed);
-            }
-            else
-            {
-                cube.localPosition = targetLocalPos;
-            }
-
-            // 4. Lazerin kendisi küpe baksın
-            Vector3 directionToCube = cube.position - laser.transform.position;
-            if (directionToCube != Vector3.zero)
-            {
-                laser.transform.rotation = Quaternion.LookRotation(directionToCube, transform.up);
-            }
-        }
+        Vector3 targetPointPosition = new Vector3(mousePos.x, mousePos.y, targetDistance);
+        targetPoint.position = mainCam.ScreenToWorldPoint(targetPointPosition);
     }
 
-    private void HandleInput()
+    private void AimLasers()
     {
-        bool mouseFiring = Mouse.current != null && Mouse.current.leftButton.isPressed;
-        bool spaceFiring = Keyboard.current != null && Keyboard.current.spaceKey.isPressed;
-        bool legacyMouseFiring = Input.GetMouseButton(0);
+        if (targetPoint == null) return;
 
-        if (mouseFiring || spaceFiring || legacyMouseFiring)
-        {
-            if (!isFiring)
-            {
-                isFiring = true;
-                SetLaserEmission(true);
-            }
-        }
-        else
-        {
-            if (isFiring)
-            {
-                isFiring = false;
-                SetLaserEmission(false);
-            }
-        }
-    }
+        Vector3 fireDirection = targetPoint.position - transform.position;
+        if (fireDirection.sqrMagnitude < 0.001f) return;
 
-    private void SetLaserEmission(bool active)
-    {
-        if (lasers == null) return;
+        Quaternion rotationToTarget = Quaternion.LookRotation(fireDirection);
 
-        foreach (var laser in lasers)
+        foreach (ParticleSystem laser in lasers)
         {
             if (laser == null) continue;
-
-            var emission = laser.emission;
-            emission.enabled = active;
-
-            if (active && !laser.isPlaying)
-            {
-                laser.Play();
-            }
-            else if (!active && laser.isPlaying)
-            {
-                laser.Stop(true, ParticleSystemStopBehavior.StopEmitting);
-            }
+            laser.transform.rotation = rotationToTarget;
         }
     }
 
-    private void OnDrawGizmosSelected()
+    public void SetRapidFire(bool active)
     {
-        if (lasers == null) return;
-
-        Gizmos.color = Color.red;
-        for (int i = 0; i < lasers.Length; i++)
-        {
-            if (lasers[i] == null) continue;
-
-            Transform cube = null;
-            if (targetCubes != null && i < targetCubes.Length)
-            {
-                cube = targetCubes[i];
-            }
-
-            if (cube != null)
-            {
-                Gizmos.DrawLine(lasers[i].transform.position, cube.position);
-                Gizmos.DrawWireCube(cube.position, cube.localScale);
-            }
-        }
+        rapidFireActive = active;
     }
 }
